@@ -18,6 +18,10 @@ import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
+import { sanitizeSenderName, senderNameFromEvent } from './sender-name.js';
+import { createStyleCorpus } from './style-corpus.js';
+import { computeStyleProfile, formatStyleBlock } from './style-profile.js';
+import { computeFeedback } from './style-feedback.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
@@ -26,8 +30,9 @@ import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, in
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
-import { resolvePriceTable } from './model-prices.js';
-import { createTokenLedger } from './token-ledger.js';
+import { normalizeUsage, resolvePriceTable } from './model-prices.js';
+import { createTokenLedger, usageOfEvent } from './token-ledger.js';
+import { decideGuardAction, formatGuardNotify, formatGuardReset } from './context-guard.js';
 import {
   loadSlang,
   saveSlang,
@@ -543,6 +548,62 @@ function normalizeReasoningEffort(value) {
   return v;
 }
 
+/** 把 DSH 的 modelCatalog 归一化成前端好用的 provider→模型 树（字段缺失一律降级，不抛错）。 */
+function catalogForUi(catalog) {
+  const groups = Array.isArray(catalog?.groups) ? catalog.groups : [];
+  return groups
+    .map((group) => ({
+      id: String(group?.id ?? ''),
+      name: String(group?.name ?? group?.label ?? group?.id ?? ''),
+      models: (Array.isArray(group?.models) ? group.models : [])
+        .map((entry) => ({
+          id: String(entry?.id ?? ''),
+          name: String(entry?.name ?? entry?.label ?? entry?.id ?? ''),
+          contextWindow: Number(entry?.contextWindow ?? entry?.context ?? 0) || null,
+          input: Array.isArray(entry?.input)
+            ? entry.input
+            : (Array.isArray(entry?.inputModalities) ? entry.inputModalities : null),
+          efforts: (Array.isArray(entry?.reasoning?.efforts) ? entry.reasoning.efforts : [])
+            .map((e) => String(e?.id ?? ''))
+            .filter(Boolean),
+          defaultEffort: entry?.reasoning?.defaultEffort ?? null,
+        }))
+        .filter((m) => m.id),
+    }))
+    .filter((g) => g.id);
+}
+
+/** provider / model 标识符校验：只允许字母数字与 . _ : / -（模型 id 里常见斜杠）。 */
+function normalizeDshIdentifier(value, label) {
+  const v = String(value ?? '').trim();
+  if (!v) throw new Error(`${label} 不能为空`);
+  if (v.length > 200) throw new Error(`${label} 过长（最多 200 字符）`);
+  if (!/^[A-Za-z0-9._:/-]+$/.test(v)) throw new Error(`${label} 只能包含字母、数字与 . _ : / -`);
+  return v;
+}
+
+/**
+ * 只写 config.json 的 dsh.{provider,model,reasoningEffort}。
+ * 内存里的 cfg 与热更新代号由调用方（路由处）处理 —— 这样本函数只依赖
+ * 模块级的 readConfigObject / atomicWriteJson，不牵扯声明顺序。
+ */
+function writeDshSelectionToConfig(configFile, { provider, model, reasoningEffort }) {
+  const file = readConfigObject(configFile);
+  const patch = { provider, model };
+  if (reasoningEffort) patch.reasoningEffort = reasoningEffort;
+  file.dsh = { ...(file.dsh ?? {}), ...patch };
+  atomicWriteJson(configFile, file);
+  return file.dsh;
+}
+
+/** 只写 config.json 的 dsh.modelPresets。 */
+function writeDshPresetsToConfig(configFile, list) {
+  const file = readConfigObject(configFile);
+  file.dsh = { ...(file.dsh ?? {}), modelPresets: list };
+  atomicWriteJson(configFile, file);
+  return file.dsh;
+}
+
 // 敏感文本脱敏：把 SENSITIVE_RE 命中的片段替换为 ***，供日志/反馈/活动记录写入前使用。
 // SENSITIVE_RE 未带 g 标志，这里动态补 g 以替换所有命中片段。
 function redactSensitiveText(text) {
@@ -698,7 +759,7 @@ function loadConfig() {
       skipProbability: 0.15,          // 普通闲聊沉默概率（当前控制台保存值）
       surrenderProbability: 0,        // 已弃用：桥接不再直接生成退让短句（避免割裂），保留字段兼容旧配置
       // 摘要与展示
-      maxReplyChars: 500,             // 单条 QQ 消息安全长度上限（防 AI 出 bug；分句交给 AI 用空格控制）
+      maxReplyChars: 120,             // 单条 QQ 消息安全长度上限（防 AI 出 bug；分句交给 AI 用空格控制）
       mustReplyKeywords: ['deepseek', '小鲸鱼', '大肥鱼', '鲸鱼', 'd指导', '在吗'],
       // 真人式多消息分条发送：按空格分句，AI 用空格表示“这里要分成下一条”
       burstEnabled: true,             // 总开关：是否允许按空格拆成多条 QQ 消息
@@ -775,7 +836,7 @@ function loadConfig() {
         longGapMaxMs: 10000,
         maxSendPerMinute: 8,
         maxSendPerHour: 60,
-        maxMessageChars: 500,
+        maxMessageChars: 120,
         maxGapMs: 10000,
         gapBaseMs: 800,
         gapPerCharMs: 20,
@@ -822,6 +883,20 @@ function loadConfig() {
         wakeMaxChars: 6000
       },
       ...(file.socialV2 ?? {})
+    },
+    // 上下文守卫：监控各会话输入上下文规模，超阈值提醒管理员（可选自动重置）。
+    // 口径为 provider 实报的输入 token（cacheHit+cacheMiss）——DSH 面板的 surfaceTokens
+    // 约为其一半。实测：>约 14 万后每步首字延迟显著变差（30 秒级起步），故默认阈值 14 万。
+    contextGuard: {
+      enabled: true,
+      warnTokens: 140000,
+      notifyCooldownMs: 6 * 60 * 60 * 1000,
+      // >0 时达到阈值且会话空闲即自动重置（与 /reset 同款流程，会清掉该会话的二代记忆）。
+      // 默认 0（关闭）：重置是有感知的破坏操作，由管理员显式开启。
+      autoResetTokens: 0,
+      quietMs: 60 * 1000,
+      checkIntervalMs: 5 * 60 * 1000,
+      ...(file.contextGuard ?? {})
     }
   };
 
@@ -1275,6 +1350,15 @@ const REJECT_WORDS = new Set(['拒绝', '不同意', '不允许', '驳回', 'no'
 // 未收紧时给出可复制的提权命令）。null = 还没跑/平台不适用。
 let stateDirHardened = null;
 
+// 群聊语料库（L0）：append-only，只采白名单群，私聊不入库。
+// 语感学习、few-shot 样本选择、反馈打分都以它为数据源。
+let styleCorpus = null;
+function recordStyleCorpus(key, entry) {
+  if (!styleCorpus) return;
+  if (!String(key || '').startsWith('group:')) return;
+  styleCorpus.record({ key, ...entry });
+}
+
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
@@ -1282,6 +1366,85 @@ async function main() {
   hardenStateDirAcl();
   acquireLock();
   loadState();
+
+  // ── 语料库（L0）────────────────────────────────────────────────────────
+  // 只采群聊（私聊由 recordStyleCorpus 拦掉）；30 天滚动；单条 120 字。
+  styleCorpus = cfg.style?.enabled === false ? null : createStyleCorpus({
+    dir: path.join(STATE_DIR, 'style'),
+    textMax: Number(cfg.style?.textMax) || 120,
+    maxAgeMs: (Number(cfg.style?.maxAgeDays) || 30) * 24 * 60 * 60 * 1000,
+    log,
+  });
+  if (styleCorpus) {
+    const pruneOnce = () => {
+      try {
+        const kept = styleCorpus.prune();
+        log(`语料库裁剪完成，保留 ${kept} 条`);
+      } catch (error) {
+        log('语料库裁剪失败:', error?.message ?? error);
+      }
+    };
+    setTimeout(pruneOnce, 30_000).unref?.();
+    setInterval(pruneOnce, 6 * 60 * 60 * 1000).unref?.();
+    log(`语料库已就绪：${styleCorpus.file}`);
+
+    // 一次性补录：把 social-v2 窗口里还在的群消息导入语料库。
+    // 幂等——先读现有 messageId，已存在的不重复写（模块内的去重集合不跨进程）。
+    try {
+      const existing = new Set(
+        styleCorpus.readAll().map((r) => (r.m ? String(r.m) : '')).filter(Boolean),
+      );
+      let added = 0;
+      const sv = readJsonSafe(SOCIAL_V2_FILE, {});
+      for (const [key, state] of Object.entries(sv?.conversations || {})) {
+        if (!String(key).startsWith('group:')) continue;
+        for (const m of state?.recentMessages || []) {
+          // 历史 bot 发言不补录：它们没有 messageId 可去重，且语感卡只用真人消息；
+          // 反馈打分从实时记录开始积累（实时记录带发送后的真实时间）。
+          if (m?.isSelf) continue;
+          const mid = m?.messageId != null ? String(m.messageId) : '';
+          if (mid && existing.has(mid)) continue;
+          const text = String(m?.plain ?? m?.text ?? '');
+          if (!text) continue;
+          const ok = styleCorpus.record({
+            key,
+            userId: m?.userId != null ? String(m.userId) : '',
+            name: m?.isSelf ? '我' : sanitizeSenderName(m?.sender, m?.userId != null ? m.userId : '未知'),
+            text,
+            isSelf: !!m?.isSelf,
+            quoteSelf: !!m?.quoteTargetIsSelf,
+            messageId: mid || null,
+            time: Number(m?.time) || undefined,
+          });
+          if (ok) added += 1;
+        }
+      }
+      if (added) log(`语料库补录 ${added} 条历史群消息`);
+    } catch (error) {
+      log('语料库补录失败:', error?.message ?? error);
+    }
+  }
+
+  // 语感卡：每 10 分钟从语料重算一次；语料不足时返回空串（不注入）。
+  const styleProfileCache = { at: 0, block: '' };
+  const currentStyleBlock = () => {
+    if (!styleCorpus) return '';
+    const now = Date.now();
+    if (now - styleProfileCache.at < 10 * 60 * 1000) return styleProfileCache.block;
+    try {
+      const profile = computeStyleProfile(styleCorpus.readAll());
+      styleProfileCache.at = now;
+      styleProfileCache.block = formatStyleBlock(profile);
+      if (profile && !styleProfileCache.lastLogged) {
+        styleProfileCache.lastLogged = true;
+        log(`语感卡已生成：${profile.sampleCount} 条样本，句长中位 ${profile.lenMedian} 字`);
+      }
+    } catch (error) {
+      log('语感卡计算失败:', error?.message ?? error);
+      styleProfileCache.at = now;
+    }
+    return styleProfileCache.block;
+  };
 
   // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
   let slangEntries = [];
@@ -2292,6 +2455,14 @@ async function main() {
 
   /** sessionId -> 最近一次已知的实际模型。切换模型会让单价差好几倍，所以按会话记。 */
   const sessionModels = new Map();
+  // ── 上下文守卫状态（2026-10-18 新增） ──
+  // sessionId -> 最近一步的输入 token（provider 口径 cacheHit+cacheMiss）。
+  const sessionContextTokens = new Map();
+  // sessionId -> 最近一次任何事件的时间（用于判定"会话空闲"，供自动重置用）。
+  const sessionLastEventAt = new Map();
+  // key -> 上次提醒时间 / 提醒时的规模（冷却与涨幅重提醒）。
+  const contextGuardNotifiedAt = new Map();
+  const contextGuardNotifiedTokens = new Map();
   const nominalModel = () => cfg.dsh?.model || 'deepseek-flash';
 
   function rememberModel(sessionId, selection) {
@@ -2312,6 +2483,14 @@ async function main() {
         model: event?.data?.usage?.model ?? known?.model,
         provider: event?.data?.provider ?? known?.provider
       });
+      // 上下文守卫取数：带 usage 的事件即刷新该会话的输入上下文（provider 口径）。
+      const usage = usageOfEvent(event);
+      if (usage !== undefined) {
+        const buckets = normalizeUsage(usage);
+        const input = Number(buckets?.cacheHit || 0) + Number(buckets?.cacheMiss || 0);
+        if (input > 0) sessionContextTokens.set(sessionId, input);
+      }
+      sessionLastEventAt.set(sessionId, Date.now());
     } catch (error) {
       log('token 账本：摄入事件失败', error?.message ?? error);
     }
@@ -2338,6 +2517,24 @@ async function main() {
       });
       tokenLedger.ingestSnapshotRecords({ sessionId, records: snapshot.records });
       rebuildInFlightCollector(sessionId, snapshot.records);
+      // 上下文守卫：用快照里最近一条带 usage 的历史事件给该会话播种当前规模，
+      // 这样桥接重启后无需等新事件，守卫也能立即对大会话给出提醒。
+      // 播种时同时记一次"活跃时间"，避免刚开机就被判定为空闲而触发自动重置。
+      try {
+        const records = Array.isArray(snapshot.records) ? snapshot.records : [];
+        for (let i = records.length - 1; i >= 0; i -= 1) {
+          const ev = records[i]?.type === 'event' ? records[i].event : records[i];
+          const usage = usageOfEvent(ev);
+          if (usage === undefined) continue;
+          const buckets = normalizeUsage(usage);
+          const input = Number(buckets?.cacheHit || 0) + Number(buckets?.cacheMiss || 0);
+          if (input > 0) {
+            sessionContextTokens.set(sessionId, input);
+            sessionLastEventAt.set(sessionId, Date.now());
+          }
+          break;
+        }
+      } catch { /* 快照格式异常不影响主链路 */ }
     } catch (error) {
       log('token 账本：处理会话快照失败', error?.message ?? error);
     }
@@ -2632,6 +2829,112 @@ async function main() {
     saveSocialV2State();
     stopRetiredSessionWork(sessionId, key);
     log(`会话权限已变化，停用旧映射 ${key} -> ${sessionId}`);
+  }
+
+  /**
+   * 重置一个会话的上下文（QQ /reset 命令、控制台重置、上下文守卫自动重置三处共用）：
+   * 清映射与各项内存态 → 停掉 DSH 侧在途工作 → 归档旧会话。返回旧 sessionId（无会话时 null）。
+   */
+  async function resetConversationContext(key) {
+    const old = state.sessions[key];
+    if (!old) return null;
+    sessionEpoch++;
+    delete state.sessions[key];
+    modelAppliedSessions.delete(old);
+    // 权限元数据必须与映射一起删除，否则会永久残留在 sessions.json 里。
+    delete state.sessionPolicies[key];
+    reverse.delete(old);
+    collectors.delete(old);
+    sendToolSucceededSessions.delete(old);
+    pendingSendToolCalls.delete(old);
+    v2TurnStartAt.delete(old);
+    toolCallNames.delete(old);
+    social.silentTurns.delete(old);
+    social.exitingSessions.delete(old);
+    const pe = pending.get(key);
+    if (pe) {
+      clearTimeout(pe.timer);
+      cancelPendingEntry(pe).catch(() => {});
+    }
+    pending.delete(key);
+    queued.delete(key);
+    queuedHintAt.delete(key);
+    sessionPromises.delete(key);
+    drainPromptQueue(key, '会话已重置');
+    social.recentMessages.delete(key);
+    messageMediaStore.delete(key);
+    social.pendingSummaries.delete(key);
+    social.states.delete(key);
+    social.silentContext.delete(key);
+    slangWindows.delete(key);
+    slangExtractionCooldowns.delete(key);
+    slangSubmitTimes.delete(key);
+    cancelSocialTimers(key);
+    clearSocialV2Timers(key);
+    pendingWakeKeys.delete(key);
+    wakeConfigUpdatedKeys.delete(key);
+    markReadCalledKeys.delete(key);
+    wakeConfigMissCount.delete(key);
+    forgetAgentToken(key);
+    socialV2.conversations.delete(key);
+    seenForwardIds.delete(key);
+    saveSocialV2State();
+    saveState();
+    // 与 retireSession 一致：先终止 DSH 侧排队的工作，再归档（归档只隐藏会话）。
+    try { await api.stopSessionWork(old); }
+    catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
+    try { await api.workspace.archiveSession({ sessionId: old }); } catch {}
+    return old;
+  }
+
+  // ── 上下文守卫巡检：长会话上下文膨胀时提醒管理员 / 按配置自动重置 ────────────
+  // 数据取自 recordSessionUsage（每条带 usage 的事件刷新 provider 口径输入 token）。
+  function contextGuardTick() {
+    const guard = cfg.contextGuard ?? {};
+    if (guard.enabled === false) return;
+    const now = Date.now();
+    for (const [sessionId, tokens] of sessionContextTokens) {
+      const key = reverse.get(sessionId);
+      if (!key) continue;
+      const lastNotifyAt = contextGuardNotifiedAt.get(key) ?? 0;
+      const notifiedTokens = contextGuardNotifiedTokens.get(key) ?? 0;
+      // 上下文回落（刚重置/刚被裁）后解除冷却与涨幅记忆，下次超标可重新提醒。
+      if (notifiedTokens > 0 && tokens < notifiedTokens * 0.6) {
+        contextGuardNotifiedAt.delete(key);
+        contextGuardNotifiedTokens.delete(key);
+      }
+      const quiet = now - (sessionLastEventAt.get(sessionId) ?? 0) >= Math.max(10000, Number(guard.quietMs) || 60000);
+      const decision = decideGuardAction({
+        tokens,
+        warnTokens: Number(guard.warnTokens) || 0,
+        autoResetTokens: Number(guard.autoResetTokens) || 0,
+        notifyCooldownMs: Number(guard.notifyCooldownMs) || 0,
+        lastNotifyAt,
+        notifiedTokens,
+        quiet,
+        now
+      });
+      if (decision.action === 'auto-reset') {
+        void (async () => {
+          const old = await resetConversationContext(key);
+          if (!old) return;
+          sessionContextTokens.delete(sessionId);
+          sessionLastEventAt.delete(sessionId);
+          contextGuardNotifiedAt.delete(key);
+          contextGuardNotifiedTokens.delete(key);
+          log(`上下文守卫：自动重置 ${key}（旧会话 ${old}，约 ${Math.round(tokens / 1000)}k tokens）`);
+          appendActivity(`[context-guard] 自动重置 ${key}（上下文约 ${Math.round(tokens / 1000)}k tokens）`);
+          await sendToQQ(`private:${cfg.ownerQQ}`, formatGuardReset(key, tokens));
+        })().catch((error) => log('上下文守卫：自动重置失败', error?.message ?? error));
+      } else if (decision.action === 'notify') {
+        contextGuardNotifiedAt.set(key, now);
+        contextGuardNotifiedTokens.set(key, tokens);
+        log(`上下文守卫：${key} 上下文约 ${Math.round(tokens / 1000)}k tokens，已提醒管理员`);
+        appendActivity(`[context-guard] ${key} 上下文约 ${Math.round(tokens / 1000)}k tokens，已提醒管理员`);
+        void sendToQQ(`private:${cfg.ownerQQ}`, formatGuardNotify(key, tokens))
+          .catch((error) => log('上下文守卫：发送提醒失败', error?.message ?? error));
+      }
+    }
   }
 
   function reconcileSessionPolicies() {
@@ -3869,12 +4172,14 @@ async function main() {
           let labels = {};
           let providerDefault = null;
           let catalogSource = 'fallback';
+          let catalog = null;
+          let catalogError = null;
           try {
             if (!modelCatalogInFlight) {
               modelCatalogInFlight = withTimeout(fetchModelCatalog(), 3000, 'session/modelCatalog')
                 .finally(() => { modelCatalogInFlight = null; });
             }
-            const catalog = unwrap(await modelCatalogInFlight, 'session.modelCatalog');
+            catalog = unwrap(await modelCatalogInFlight, 'session.modelCatalog');
             const group = (catalog?.groups ?? []).find((g) => g?.id === provider);
             const entry = (group?.models ?? []).find((m) => m?.id === model);
             const efforts = entry?.reasoning?.efforts ?? [];
@@ -3888,6 +4193,7 @@ async function main() {
           } catch (error) {
             // 同一条失败原因只记一次：控制台每次刷新都会打这条接口，否则日志会被刷爆。
             const reason = String(error?.message ?? error);
+            catalogError = reason;
             if (!modelCatalogErrorLogged.has(reason)) {
               modelCatalogErrorLogged.add(reason);
               log(`读取 DSH 模型能力失败，思考强度暂用内置清单：${reason}`);
@@ -3902,6 +4208,9 @@ async function main() {
             default: REASONING_EFFORT_DEFAULT,
             providerDefault,
             catalogSource,
+            // 控制台的模型选择器：DSH 实际公布的 provider→模型 树（拿不到就是空数组）
+            providers: catalogForUi(catalog),
+            catalogError,
             // selectModel 会同时写会话级与 DSH 全局默认（~/.dsh/settings.yaml 的 agent-default-model），
             // 控制台要把这点明确告诉管理员，避免「只想调 QQ 助手却改了 Web GUI 新会话默认」的意外。
             globalSideEffect: true,
@@ -3923,6 +4232,109 @@ async function main() {
           modelSelectionEpoch += 1;
           log(`控制台：DSH 思考强度已设为 ${effort}（对已有会话于下一条消息生效）`);
           sendJson({ ok: true, reasoningEffort: effort });
+          return;
+        }
+        // ── 控制台：切换模型（写 config.json 的 dsh.provider / dsh.model）────────
+        if (req.method === 'POST' && url.pathname === '/api/dsh/model') {
+          const body = await readBody();
+          let provider;
+          let model;
+          let effort;
+          try {
+            provider = normalizeDshIdentifier(body.provider, 'provider');
+            model = normalizeDshIdentifier(body.model, 'model');
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? 'provider/model 无效' }, 400);
+            return;
+          }
+          if (body.reasoningEffort !== undefined && body.reasoningEffort !== null && body.reasoningEffort !== '') {
+            try { effort = normalizeReasoningEffort(body.reasoningEffort); }
+            catch (error) { sendJson({ ok: false, error: error?.message ?? '思考强度无效' }, 400); return; }
+          }
+          const configFile = path.join(ROOT, 'config.json');
+          try {
+            writeDshSelectionToConfig(configFile, { provider, model, reasoningEffort: effort });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+            return;
+          }
+          cfg.dsh = { ...(cfg.dsh ?? {}), provider, model, ...(effort ? { reasoningEffort: effort } : {}) };
+          modelSelectionEpoch += 1;
+          log(`控制台：DSH 模型已设为 ${provider}/${model}${effort ? ` (${effort})` : ''}（对已有会话于下一条消息生效）`);
+          sendJson({ ok: true, provider, model, reasoningEffort: cfg.dsh.reasoningEffort });
+          return;
+        }
+        // ── 控制台：模型预设（一键切换）────────────────────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/dsh/presets') {
+          sendJson({
+            ok: true,
+            presets: Array.isArray(cfg.dsh?.modelPresets) ? cfg.dsh.modelPresets : [],
+            current: {
+              provider: String(cfg.dsh?.provider || ''),
+              model: String(cfg.dsh?.model || ''),
+              reasoningEffort: String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT),
+            },
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/dsh/presets') {
+          const body = await readBody();
+          const action = String(body.action ?? 'save');
+          const configFile = path.join(ROOT, 'config.json');
+          const list = Array.isArray(cfg.dsh?.modelPresets) ? cfg.dsh.modelPresets.slice() : [];
+
+          if (action === 'delete') {
+            const name = String(body.name ?? '').trim();
+            if (!name) { sendJson({ ok: false, error: '预设名不能为空' }, 400); return; }
+            const next = list.filter((p) => String(p?.name ?? '') !== name);
+            try { writeDshPresetsToConfig(configFile, next); }
+            catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 500); return; }
+            cfg.dsh = { ...(cfg.dsh ?? {}), modelPresets: next };
+            log(`控制台：已删除模型预设「${name}」`);
+            sendJson({ ok: true, presets: next });
+            return;
+          }
+
+          if (action === 'apply') {
+            const name = String(body.name ?? '').trim();
+            const preset = list.find((p) => String(p?.name ?? '') === name);
+            if (!preset) { sendJson({ ok: false, error: '没有这个预设' }, 404); return; }
+            let provider;
+            let model;
+            let effort;
+            try {
+              provider = normalizeDshIdentifier(preset.provider, 'provider');
+              model = normalizeDshIdentifier(preset.model, 'model');
+              if (preset.reasoningEffort) effort = normalizeReasoningEffort(preset.reasoningEffort);
+            } catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 400); return; }
+            try { writeDshSelectionToConfig(configFile, { provider, model, reasoningEffort: effort }); }
+            catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 500); return; }
+            cfg.dsh = { ...(cfg.dsh ?? {}), provider, model, ...(effort ? { reasoningEffort: effort } : {}) };
+            modelSelectionEpoch += 1;
+            log(`控制台：已切到模型预设「${name}」→ ${provider}/${model}${effort ? ` (${effort})` : ''}（下一条消息生效）`);
+            sendJson({ ok: true, provider, model, reasoningEffort: cfg.dsh.reasoningEffort });
+            return;
+          }
+
+          // 默认动作：save（同名覆盖）
+          const name = String(body.name ?? '').trim().slice(0, 40);
+          if (!name) { sendJson({ ok: false, error: '预设名不能为空' }, 400); return; }
+          let provider;
+          let model;
+          let effort;
+          try {
+            provider = normalizeDshIdentifier(body.provider ?? cfg.dsh?.provider, 'provider');
+            model = normalizeDshIdentifier(body.model ?? cfg.dsh?.model, 'model');
+            const raw = body.reasoningEffort ?? cfg.dsh?.reasoningEffort;
+            effort = raw ? normalizeReasoningEffort(raw) : REASONING_EFFORT_DEFAULT;
+          } catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 400); return; }
+          const next = list.filter((p) => String(p?.name ?? '') !== name);
+          next.push({ name, provider, model, reasoningEffort: effort });
+          try { writeDshPresetsToConfig(configFile, next); }
+          catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 500); return; }
+          cfg.dsh = { ...(cfg.dsh ?? {}), modelPresets: next };
+          log(`控制台：已保存模型预设「${name}」= ${provider}/${model} (${effort})`);
+          sendJson({ ok: true, presets: next, saved: { name, provider, model, reasoningEffort: effort } });
           return;
         }
 
@@ -4863,9 +5275,11 @@ async function main() {
               return;
             }
           }
+          // st/now 必须在 try 外：catch 的回滚分支会引用它们（此前定义在 try 内，
+          // 发送失败时 catch 抛 ReferenceError「st is not defined」，真实错误被吞掉）。
+          const st = getSocialV2State(key);
+          const now = Date.now();
           try {
-            const st = getSocialV2State(key);
-            const now = Date.now();
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
             const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
@@ -5681,7 +6095,7 @@ async function main() {
           // GET 不再触发强制同步（写副作用不能挂在读接口上）：请用 POST /api/stickers/sync。
           try {
             const synced = await syncStickerLibrary(false);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
+            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count, { compact: false });
             sendJson({ ok: true, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情失败：${error?.message ?? error}` }, 500);
@@ -6294,6 +6708,20 @@ async function main() {
           sendJson({ ok: true, key, category, memory: formatMemoryV2(st) });
           return;
         }
+        if (req.method === 'GET' && url.pathname === '/api/style/summary') {
+          const rows = styleCorpus ? styleCorpus.readAll() : [];
+          const profile = computeStyleProfile(rows);
+          const feedback = computeFeedback(rows);
+          const { samples, ...feedbackSummary } = feedback;
+          sendJson({
+            ok: true,
+            profile,
+            styleBlock: formatStyleBlock(profile),
+            feedback: { ...feedbackSummary, recent: samples.slice(-30) },
+            corpus: styleCorpus ? styleCorpus.stats() : null,
+          });
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/memory') {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const category = String(url.searchParams.get('category') ?? '').trim();
@@ -6581,9 +7009,11 @@ async function main() {
           const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
           if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
           if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
+          // st/now 必须在 try 外：catch 的回滚分支会引用它们（此前定义在 try 内，
+          // 发送失败时 catch 抛 ReferenceError「st is not defined」，真实错误被吞掉）。
+          const st = getSocialV2State(key);
+          const now = Date.now();
           try {
-            const st = getSocialV2State(key);
-            const now = Date.now();
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
             const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
@@ -6627,53 +7057,7 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '');
           if (!key || !state.sessions[key]) { sendJson({ ok: false, error: '会话不存在' }, 404); return; }
-          sessionEpoch++;
-          const oldSessionId = state.sessions[key];
-          delete state.sessions[key];
-          modelAppliedSessions.delete(oldSessionId);
-          // 权限元数据必须与映射一起删除，否则会永久残留在 sessions.json 里。
-          delete state.sessionPolicies[key];
-          reverse.delete(oldSessionId);
-          collectors.delete(oldSessionId);
-          sendToolSucceededSessions.delete(oldSessionId);
-          pendingSendToolCalls.delete(oldSessionId);
-          v2TurnStartAt.delete(oldSessionId);
-          toolCallNames.delete(oldSessionId);
-          const pe = pending.get(key);
-          if (pe) {
-            clearTimeout(pe.timer);
-            cancelPendingEntry(pe).catch(() => {});
-          }
-          pending.delete(key);
-          queued.delete(key);
-          queuedHintAt.delete(key);
-          sessionPromises.delete(key);
-          drainPromptQueue(key, '会话已重置');
-          social.recentMessages.delete(key);
-          messageMediaStore.delete(key);
-          social.pendingSummaries.delete(key);
-          social.states.delete(key);
-          social.silentContext.delete(key);
-          social.silentTurns.delete(oldSessionId);
-          social.exitingSessions.delete(oldSessionId);
-          slangWindows.delete(key);
-          slangExtractionCooldowns.delete(key);
-          slangSubmitTimes.delete(key);
-          cancelSocialTimers(key);
-          clearSocialV2Timers(key);
-          pendingWakeKeys.delete(key);
-          wakeConfigUpdatedKeys.delete(key);
-          markReadCalledKeys.delete(key);
-          wakeConfigMissCount.delete(key);
-          forgetAgentToken(key);
-          socialV2.conversations.delete(key);
-          seenForwardIds.delete(key);
-          saveSocialV2State();
-          saveState();
-          // 归档只隐藏会话，不终止 DSH 侧排队的工作；先清队列并取消当前回合。
-          try { await api.stopSessionWork(oldSessionId); }
-          catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
-          try { await api.workspace.archiveSession({ sessionId: oldSessionId }); } catch {}
+          const oldSessionId = await resetConversationContext(key);
           log(`控制台：已清除会话上下文 ${key}（旧会话 ${oldSessionId} 已停止并归档）`);
           sendJson({ ok: true, key, archived: oldSessionId });
           return;
@@ -8256,6 +8640,13 @@ async function main() {
       hasMedia: Array.isArray(media) && media.length > 0,
       time: Date.now()
     });
+    recordStyleCorpus(key, {
+      name: sender,
+      text: String(plainText ?? textContent),
+      isSelf: false,
+      quoteSelf: !!quoteTargetIsSelf,
+      messageId: messageRef,
+    });
     const cap = Math.max(50, Number(cfg.social?.contextWindow ?? 15) * 2);
     while (arr.length > cap) arr.shift();
   }
@@ -8922,7 +9313,7 @@ async function main() {
       let name = null;
       try {
         const info = await bot.getGroupMemberInfo(Number(groupId), Number(userId));
-        name = info?.card || info?.nickname || null;
+        name = sanitizeSenderName(info?.card || info?.nickname, '') || null;
       } catch {}
       if (name) {
         groupMemberNameCache.set(key, { name, ts: Date.now() });
@@ -8934,7 +9325,7 @@ async function main() {
       const members = Array.isArray(list) ? list : (list?.data ?? []);
       const now = Date.now();
       for (const m of members) {
-        const n = m?.card || m?.nickname || null;
+        const n = sanitizeSenderName(m?.card || m?.nickname, '') || null;
         if (n) groupMemberNameCache.set(`${String(groupId)}:${String(m.user_id)}`, { name: n, ts: now });
       }
       pruneGroupMemberNameCache();
@@ -9006,7 +9397,7 @@ async function main() {
           return null;
         }
       }
-      const sender = raw.sender?.card || raw.sender?.nickname || String(raw.sender?.user_id ?? raw.user_id ?? '未知');
+      const sender = sanitizeSenderName(raw.sender?.card || raw.sender?.nickname, String(raw.sender?.user_id ?? raw.user_id ?? '未知'));
       const text = await segmentsToText(raw.message ?? [], {
         resolveAtName: kind === 'group' ? (qq) => resolveGroupMemberName(convId, qq) : null,
         includeReply: false
@@ -9131,6 +9522,14 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    recordStyleCorpus(key, {
+      userId: userId != null ? String(userId) : '',
+      name: sender,
+      text: String(plainContent ?? textContent ?? ''),
+      isSelf: false,
+      quoteSelf: !!quoteTargetIsSelf,
+      messageId: msg.messageId,
+    });
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -9201,6 +9600,7 @@ async function main() {
         isSelf: true,
         time: now + i * 1000
       });
+      recordStyleCorpus(key, { name: '我', text, isSelf: true });
     }
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
@@ -9340,7 +9740,7 @@ async function main() {
     if (Array.isArray(tr.speakerIds) && tr.speakerIds.length) {
       const speakerId = String(event?.user_id ?? event?.sender?.user_id ?? '');
       if (speakerId && tr.speakerIds.some((id) => String(id) === speakerId)) {
-        const senderLabel = event?.sender?.card || event?.sender?.nickname || speakerId;
+        const senderLabel = sanitizeSenderName(event?.sender?.card || event?.sender?.nickname, speakerId);
         return `speaker:${senderLabel}`;
       }
     }
@@ -9469,8 +9869,8 @@ async function main() {
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
     const replyTiming = replyTimingV2(st);
-    const replyLine = `【首回复节奏】先处理已有消息，完整的问题及时回答。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})；从最后来信计时，合批和读提示词的耗时也算，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。已安静够久可直接回，工具也会立即返回并补上思考期间的新消息。只有明确没说完、你确实要等下文时，才用普通 messages 长等待。\n\n`;
-    const preSleepLine = `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前 purpose="reply" 的短静默不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。如果返回里带 preSleepWaitRemainingMs，就按剩余时间继续等待。\n\n`;
+    const replyLine = `【首回复节奏】先处理已有消息。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})：从最后来信计时（含合批与读提示耗时），还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默；够久可直接回，工具会带回你思考期间的新消息。只有明确没说完、要等下文时才用普通 messages 长等待。\n\n`;
+    const preSleepLine = `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前的短静默不能代替它。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话（返回 preSleepWaitSatisfied=true），可以设置下一次唤醒并沉睡；若期间有人发新消息，先看 newMessages：不需要你参与可直接沉睡；参与了回复则下次想睡需重新等待。返回带 preSleepWaitRemainingMs 就按剩余时间继续等。\n\n`;
     const lastMsg = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
     const lastAiMin = st.lastAiReplyAt ? Math.max(0, Math.round((Date.now() - Number(st.lastAiReplyAt)) / 60000)) : null;
     const statusBits = [`未读 ${(st.unread || []).length} 条`];
@@ -9492,7 +9892,10 @@ async function main() {
     if (wcTr.anyMessage) wcTriggers.push('任意消息');
     if (Number(wcTr.probability) > 0) wcTriggers.push(`概率${wcTr.probability}`);
     const wakeLine = `【当前唤醒】${wcMode}，${wcTime}${wcTriggers.length ? `；触发：${wcTriggers.join('/')}` : ''}\n\n`;
-    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
+    const styleBlock = currentStyleBlock();
+    const hardMax = Math.max(1, Number(cfg.socialV2?.send?.maxMessageChars) || 120);
+    const styleLine = styleBlock ? `${styleBlock}\n（单条消息硬上限 ${hardMax} 字，超了会被工具拒收。）\n\n` : '';
+    const base = roleLine + tokenLine + antiAiLine + styleLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -9915,55 +10318,8 @@ async function main() {
         return;
       }
       if (plainContent === '/reset' || plainContent === '/new') {
-        const old = state.sessions[key];
-        if (old) {
-          sessionEpoch++;
-          delete state.sessions[key];
-          modelAppliedSessions.delete(old);
-          delete state.sessionPolicies[key];
-          reverse.delete(old);
-          collectors.delete(old);
-          sendToolSucceededSessions.delete(old);
-          pendingSendToolCalls.delete(old);
-          v2TurnStartAt.delete(old);
-          toolCallNames.delete(old);
-          social.silentTurns.delete(old);
-          social.exitingSessions.delete(old);
-          const pe = pending.get(key);
-          if (pe) {
-            clearTimeout(pe.timer);
-            cancelPendingEntry(pe).catch(() => {});
-          }
-          pending.delete(key);
-          queued.delete(key);
-          queuedHintAt.delete(key);
-          sessionPromises.delete(key);
-          drainPromptQueue(key, '会话已重置');
-          social.recentMessages.delete(key);
-          messageMediaStore.delete(key);
-          social.pendingSummaries.delete(key);
-          social.states.delete(key);
-          social.silentContext.delete(key);
-          slangWindows.delete(key);
-          slangExtractionCooldowns.delete(key);
-          slangSubmitTimes.delete(key);
-          cancelSocialTimers(key);
-          clearSocialV2Timers(key);
-          pendingWakeKeys.delete(key);
-          wakeConfigUpdatedKeys.delete(key);
-          markReadCalledKeys.delete(key);
-          wakeConfigMissCount.delete(key);
-          forgetAgentToken(key);
-          socialV2.conversations.delete(key);
-          seenForwardIds.delete(key);
-          saveSocialV2State();
-          saveState();
-          // 与 retireSession 一致：先终止 DSH 侧排队的工作，再归档（归档只隐藏会话）。
-          try { await api.stopSessionWork(old); }
-          catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
-          try { await api.workspace.archiveSession({ sessionId: old }); } catch {}
-          await sendToQQ(key, '已重置会话，下次消息将开新上下文');
-        }
+        const old = await resetConversationContext(key);
+        if (old) await sendToQQ(key, '已重置会话，下次消息将开新上下文');
         return;
       }
       if (plainContent === '/status') {
@@ -10002,7 +10358,7 @@ async function main() {
 
     // 二代仿真模式（reserved2）：唤醒调度
     if (currentMode === 'reserved2') {
-      const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
+      const sender = senderNameFromEvent(event, kind);
       appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
       if (kind === 'group') feedSlangWindow(key, sender, plainContent);
@@ -10027,7 +10383,7 @@ async function main() {
 
     // 黑话学习素材：只从群聊普通消息进入滚动窗口（命令/角色控制语不学；只学当前消息自己的文字，不学引用原文）
     if (kind === 'group') {
-      feedSlangWindow(key, event.sender?.card || event.sender?.nickname || String(event.user_id), plainContent);
+      feedSlangWindow(key, senderNameFromEvent(event, kind), plainContent);
     }
 
     // 角色扮演提示注入（仅注入给 agent，不影响群友之间的正常对话语义）
@@ -10038,15 +10394,15 @@ async function main() {
     const promptText = (roleHint ? roleHint + '\n\n' : '')
       + (isOwner ? '【管理员】' : '')
       + (kind === 'group'
-        ? `${event.sender?.card || event.sender?.nickname || String(event.user_id)}：${textContent}`
+        ? `${senderNameFromEvent(event, kind)}：${textContent}`
         : textContent)
       + mediaHintFor(key, messageRef, mediaList);
 
-    appendActivity(`${key} ${isOwner ? '管理员' : '群友'} ${event.sender?.nickname || event.user_id}：${textContent.slice(0, 80)}`);
+    appendActivity(`${key} ${isOwner ? '管理员' : '群友'} ${senderNameFromEvent(event, kind)}：${textContent.slice(0, 80)}`);
 
     // 仿真群友模式：reserved 走状态机（观望/活跃/试探/退场）
     if (isSocialEnabled()) {
-      const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
+      const sender = senderNameFromEvent(event, kind);
       appendRecentMessage(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, mediaList, messageRef); // AI 始终感知
       const st = socialState(key);
 
@@ -10993,6 +11349,9 @@ async function main() {
   }
   startDshWatch();
   startSnowlumaWatch();
+  // 上下文守卫：启动即巡检一次，其后按配置间隔巡检（提醒 / 可选自动重置长会话）。
+  contextGuardTick();
+  setInterval(contextGuardTick, Math.max(60_000, Number(cfg.contextGuard?.checkIntervalMs) || 5 * 60 * 1000));
   startConsoleServer();
 
   await pumpMux();
@@ -11001,11 +11360,13 @@ async function main() {
 process.on('SIGINT', () => {
   log('退出中…');
   saveState();
+  if (styleCorpus) { try { styleCorpus.close(); } catch { /* 退出路径不再抛 */ } }
   releaseLock();
   process.exit(0);
 });
 process.on('SIGTERM', () => {
   saveState();
+  if (styleCorpus) { try { styleCorpus.close(); } catch { /* 退出路径不再抛 */ } }
   releaseLock();
   process.exit(0);
 });

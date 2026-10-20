@@ -1771,6 +1771,7 @@ button:active:not(:disabled) {
       <button data-view="social-v2" class="nav-item"><span class="nav-icon" aria-hidden="true">◈</span>二代仿真<span class="nav-note">V2</span></button>
       <button data-view="social-v1" class="nav-item"><span class="nav-icon" aria-hidden="true">◇</span>一代仿真<span class="nav-note">V1</span></button>
       <button data-view="slang" class="nav-item"><span class="nav-icon" aria-hidden="true">▤</span>黑话词库</button>
+      <button data-view="style" class="nav-item"><span class="nav-icon" aria-hidden="true">◐</span>本群语感</button>
       <div class="nav-label">管理</div>
       <button data-view="usage" class="nav-item"><span class="nav-icon" aria-hidden="true">◧</span>令牌与花费</button>
       <button data-view="access" class="nav-item"><span class="nav-icon" aria-hidden="true">⊙</span>访问与安全</button>
@@ -2396,6 +2397,16 @@ button:active:not(:disabled) {
         </div>
       </details>
     </section>
+<section id="section-style" data-page="style" class="card span-all">
+      <h2>本群语感</h2>
+      <div class="meta">语料库只采白名单群聊，单条截断 120 字、保留 30 天。语感卡由本地统计生成（不调用模型），每 10 分钟重算并注入唤醒提示；反馈分统计 bot 发言后 5 分钟内是否有人接话、10 分钟内是否被引用。</div>
+      <div class="row" style="margin-top:10px">
+        <button id="styleRefresh" class="small">刷新</button>
+        <span class="meta" id="styleMsg"></span>
+      </div>
+      <div id="styleBody" style="margin-top:12px"></div>
+    </section>
+
 <section id="section-reference" data-page="reference" class="card span-all">
       <h2>DSH 侧 MCP 工具</h2>
       <div class="meta">由 qq-bridge 的 MCP server 提供给 DSH agent；修改后需重启 DSH 才会刷新工具 schema。</div>
@@ -2441,13 +2452,30 @@ button:active:not(:disabled) {
     </section>
 <section id="section-dsh" data-page="overview" class="card span-all">
       <h2 data-note="下一条消息生效">DSH 模型与思考强度</h2>
-      <div class="meta">模型：<span id="dshModelText">-</span> ｜ 提供方：<span id="dshProviderText">-</span></div>
+      <div class="meta">当前：<b id="dshModelText">-</b> ｜ 提供方：<span id="dshProviderText">-</span></div>
       <div class="row" style="margin-top:10px">
+        <label style="flex:0 0 auto">提供方</label>
+        <select id="dshProviderSelect" style="flex:0 1 200px"></select>
+        <label style="flex:0 0 auto">模型</label>
+        <input id="dshModelInput" list="dshModelList" placeholder="下拉选，或手填模型 id" style="flex:1 1 260px">
+        <datalist id="dshModelList"></datalist>
+        <button id="dshModelApply">应用</button>
+        <span class="meta" id="dshModelMsg"></span>
+      </div>
+      <div class="row">
         <label style="flex:0 0 auto">思考强度</label>
         <select id="dshEffortSelect" style="flex:0 1 220px"></select>
         <button id="dshEffortSave">保存</button>
         <span class="meta" id="dshEffortMsg"></span>
       </div>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:0 0 auto">存为预设</label>
+        <input id="dshPresetName" placeholder="给这套组合起个名（例：便宜快 / 聪明慢）" style="flex:1 1 260px">
+        <button id="dshPresetSave">保存预设</button>
+        <span class="meta" id="dshPresetMsg"></span>
+      </div>
+      <div id="dshPresetList" style="margin:6px 0"></div>
+      <div class="meta" id="dshModelNote"></div>
       <div class="meta" id="dshEffortNote"></div>
       <div class="meta" id="dshEffortSideEffect"></div>
     </section>
@@ -2925,6 +2953,29 @@ async function refreshSimPrompt() {
 }
 
 // ── DSH 模型与思考强度 ──────────────────────────────────────────────────────
+// DSH 实际公布的 provider→模型 树（由 /api/dsh/model 带回），用于下拉候选
+let dshCatalog = [];
+
+/** 按选中的 provider 重新填 datalist；返回该 provider 的模型数 */
+function fillDshModelOptions(provider) {
+  const list = document.getElementById('dshModelList');
+  list.replaceChildren();
+  const group = dshCatalog.find((g) => g.id === provider);
+  for (const m of (group?.models || [])) {
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    const bits = [];
+    if (m.name && m.name !== m.id) bits.push(m.name);
+    // 不要显示「可看图/纯文本」：DSH 的 modelCatalog 只返回 id/name/description/reasoning，
+    // 不含输入模态（inputModalities 只在 provider 配置里，DSH 内部用 resolveModelInfo 读），
+    // 拿到的一律是空 —— 显示出来只会误导。
+    if (m.contextWindow) bits.push(`${Math.round(m.contextWindow / 1000)}k 上下文`);
+    opt.label = bits.join(' · ');
+    list.appendChild(opt);
+  }
+  return group?.models?.length || 0;
+}
+
 async function refreshDshModel() {
   try {
     const r = await api('/api/dsh/model');
@@ -2943,6 +2994,31 @@ async function refreshDshModel() {
       select.appendChild(el);
     }
     select.value = r.reasoningEffort;
+    // 提供方下拉 + 模型候选：全部来自 DSH 实际公布的能力，拿不到就允许手填
+    dshCatalog = Array.isArray(r.providers) ? r.providers : [];
+    const pSel = document.getElementById('dshProviderSelect');
+    pSel.replaceChildren();
+    for (const g of dshCatalog) {
+      const el = document.createElement('option');
+      el.value = g.id;
+      el.textContent = g.name && g.name !== g.id ? `${g.id}（${g.name}）` : g.id;
+      pSel.appendChild(el);
+    }
+    if (r.provider && !dshCatalog.some((g) => g.id === r.provider)) {
+      const el = document.createElement('option');
+      el.value = r.provider;
+      el.textContent = `${r.provider}（当前值，不在清单里）`;
+      pSel.appendChild(el);
+    }
+    pSel.value = r.provider;
+    const modelCount = fillDshModelOptions(r.provider);
+    document.getElementById('dshModelInput').value = r.model || '';
+    const modelNote = [];
+    modelNote.push(dshCatalog.length
+      ? `提供方清单来自 DSH（${dshCatalog.length} 个），当前提供方有 ${modelCount} 个模型可选`
+      : '拿不到 DSH 的模型清单，可手填 provider / 模型 id');
+    if (r.catalogError) modelNote.push(`读取失败原因：${r.catalogError}`);
+    document.getElementById('dshModelNote').textContent = modelNote.join('；') + '。';
     const parts = [];
     if (r.providerDefault) parts.push(`DSH 出厂默认是 ${r.providerDefault}`);
     parts.push(r.catalogSource === 'dsh' ? '档位取自 DSH 实际公布的能力' : '未能读取 DSH 能力，档位为内置清单');
@@ -2951,8 +3027,67 @@ async function refreshDshModel() {
       ? '注意：切换会同时写入 DSH 的全局默认（~/.dsh/settings.yaml 的 agent-default-model），也就是 Web GUI 里新建会话的默认强度也会跟着变。'
       : '';
     document.getElementById('dshEffortMsg').textContent = '';
+    document.getElementById('dshModelMsg').textContent = '';
   } catch (error) {
     document.getElementById('dshEffortMsg').textContent = '读取失败：' + (error?.message ?? error);
+  }
+  refreshDshPresets();
+}
+
+/** 渲染模型预设列表（每条带「切换」「删除」） */
+async function refreshDshPresets() {
+  const box = document.getElementById('dshPresetList');
+  try {
+    const r = await api('/api/dsh/presets');
+    const cur = r.current || {};
+    const list = r.presets || [];
+    box.replaceChildren();
+    if (!list.length) {
+      const empty = document.createElement('span');
+      empty.className = 'meta';
+      empty.textContent = '还没有预设：把当前这套存一个，以后就能一键切回来。';
+      box.appendChild(empty);
+      return;
+    }
+    for (const p of list) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;margin:4px 0;flex-wrap:wrap';
+      const active = p.provider === cur.provider && p.model === cur.model;
+      const label = document.createElement('span');
+      label.className = 'meta';
+      label.textContent = `${active ? '▶ ' : ''}${p.name} — ${p.provider}/${p.model}${p.reasoningEffort ? ` (${p.reasoningEffort})` : ''}`;
+      if (active) label.style.fontWeight = '600';
+      const use = document.createElement('button');
+      use.type = 'button';
+      use.textContent = active ? '已是当前' : '切换';
+      use.disabled = active;
+      use.addEventListener('click', async () => {
+        try {
+          const rr = await api('/api/dsh/presets', 'POST', { action: 'apply', name: p.name });
+          if (rr.ok) await refreshDshModel();
+          else alert(rr.error || '切换失败');
+        } catch (error) { alert('切换失败：' + (error?.message ?? error)); }
+      });
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.textContent = '删除';
+      del.addEventListener('click', async () => {
+        if (!confirm(`删除预设「${p.name}」？`)) return;
+        try {
+          const rr = await api('/api/dsh/presets', 'POST', { action: 'delete', name: p.name });
+          if (rr.ok) refreshDshPresets();
+          else alert(rr.error || '删除失败');
+        } catch (error) { alert('删除失败：' + (error?.message ?? error)); }
+      });
+      row.append(label, use, del);
+      box.appendChild(row);
+    }
+  } catch (error) {
+    box.replaceChildren();
+    const err = document.createElement('span');
+    err.className = 'meta err';
+    err.textContent = '读取预设失败：' + (error?.message ?? error);
+    box.appendChild(err);
   }
 }
 
@@ -3130,6 +3265,58 @@ document.getElementById('dshEffortSave').addEventListener('click', async () => {
   msg.className = r.ok ? 'meta ok' : 'meta err';
   if (r.ok) refreshDshModel();
 });
+
+// ── DSH 模型：切提供方 / 应用模型 / 存预设 ──────────────────────────────────
+document.getElementById('dshProviderSelect').addEventListener('change', (event) => {
+  const provider = event.target.value;
+  const count = fillDshModelOptions(provider);
+  const group = dshCatalog.find((g) => g.id === provider);
+  if (group?.models?.length) document.getElementById('dshModelInput').value = group.models[0].id;
+  document.getElementById('dshModelNote').textContent = count
+    ? `当前提供方有 ${count} 个模型可选（下拉里带「可看图 / 上下文」标注）。`
+    : '这个提供方在 DSH 清单里没有列模型，直接手填模型 id。';
+});
+
+document.getElementById('dshModelApply').addEventListener('click', async () => {
+  const msg = document.getElementById('dshModelMsg');
+  const provider = document.getElementById('dshProviderSelect').value.trim();
+  const model = document.getElementById('dshModelInput').value.trim();
+  const reasoningEffort = document.getElementById('dshEffortSelect').value;
+  if (!provider || !model) { msg.textContent = '❌ provider 和模型 id 都要填'; msg.className = 'meta err'; return; }
+  msg.textContent = '应用中…';
+  msg.className = 'meta';
+  try {
+    const r = await api('/api/dsh/model', 'POST', { provider, model, reasoningEffort });
+    msg.textContent = r.ok
+      ? `✅ 已切到 ${r.provider}/${r.model}（${r.reasoningEffort}），下一条消息生效`
+      : ('❌ ' + (r.error || '保存失败'));
+    msg.className = r.ok ? 'meta ok' : 'meta err';
+    if (r.ok) await refreshDshModel();
+  } catch (error) {
+    msg.textContent = '❌ ' + (error?.message ?? error);
+    msg.className = 'meta err';
+  }
+});
+
+document.getElementById('dshPresetSave').addEventListener('click', async () => {
+  const msg = document.getElementById('dshPresetMsg');
+  const name = document.getElementById('dshPresetName').value.trim();
+  const provider = document.getElementById('dshProviderSelect').value.trim();
+  const model = document.getElementById('dshModelInput').value.trim();
+  const reasoningEffort = document.getElementById('dshEffortSelect').value;
+  if (!name) { msg.textContent = '❌ 先给预设起个名'; msg.className = 'meta err'; return; }
+  if (!provider || !model) { msg.textContent = '❌ provider 和模型 id 都要填'; msg.className = 'meta err'; return; }
+  try {
+    const r = await api('/api/dsh/presets', 'POST', { action: 'save', name, provider, model, reasoningEffort });
+    msg.textContent = r.ok ? `✅ 已保存预设「${name}」` : ('❌ ' + (r.error || '保存失败'));
+    msg.className = r.ok ? 'meta ok' : 'meta err';
+    if (r.ok) { document.getElementById('dshPresetName').value = ''; refreshDshPresets(); }
+  } catch (error) {
+    msg.textContent = '❌ ' + (error?.message ?? error);
+    msg.className = 'meta err';
+  }
+});
+
 document.getElementById('silentOn').addEventListener('click', async () => { await api('/api/role-mode', 'POST', { mode: 'silent' }); refresh(); });
 document.getElementById('silentOff').addEventListener('click', async () => { await api('/api/role-mode', 'POST', { mode: 'active' }); refresh(); });
 document.getElementById('wlSave').addEventListener('click', async () => {
@@ -3969,6 +4156,49 @@ function updateSlangSelectAll(status) {
   el.indeterminate = filtered.some((e) => slangSelected.has(e.id)) && !el.checked;
 }
 
+async function loadStylePanel() {
+  const msg = document.getElementById('styleMsg');
+  const body = document.getElementById('styleBody');
+  if (!msg || !body) return;
+  msg.textContent = '加载中…';
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  try {
+    const r = await api('/api/style/summary');
+    const p = r.profile || {};
+    const f = r.feedback || {};
+    const c = r.corpus || {};
+    const pct = (v) => (v == null ? '—' : Math.round(v * 100) + '%');
+    const metrics = [
+      ['真人样本', p.sampleCount ?? 0],
+      ['句长中位数', p.lenMedian ? p.lenMedian + ' 字' : '—'],
+      ['P90 句长', p.lenP90 ? p.lenP90 + ' 字' : '—'],
+      ['连发率', pct(p.burstRate)],
+      ['句号使用率', pct(p.periodRate)],
+      ['语气词', (p.topFillers || []).join('、') || '样本不足'],
+      ['bot 发言', f.total ?? 0],
+      ['被接话', pct(f.repliedRate)],
+      ['被引用', pct(f.quotedRate)],
+      ['语料库', `${c.total ?? 0} 条 · ${Math.round((c.sizeBytes || 0) / 1024)} KB`],
+    ];
+    const bucketRows = (f.buckets || []).map((b) => `<tr><td>${esc(b.label)}</td><td>${b.n}</td><td>${pct(b.repliedRate)}</td><td>${pct(b.quotedRate)}</td></tr>`).join('');
+    body.innerHTML = `
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">
+        ${metrics.map(([k, v]) => `<div class="metric"><div class="meta">${esc(k)}</div><div style="font-size:20px;font-weight:600">${esc(v)}</div></div>`).join('')}
+      </div>
+      <h3 style="margin-top:16px">按发言长度看反馈</h3>
+      <table>
+        <thead><tr><th>长度</th><th>条数</th><th>被接话</th><th>被引用</th></tr></thead>
+        <tbody>${bucketRows || '<tr><td colspan="4" class="meta">暂无 bot 发言样本</td></tr>'}</tbody>
+      </table>
+      <h3 style="margin-top:16px">注入唤醒提示的内容</h3>
+      <pre style="white-space:pre-wrap;line-height:1.6">${esc(r.styleBlock || '（样本不足 20 条，暂不注入）')}</pre>`;
+    msg.textContent = '已更新 ' + new Date().toLocaleTimeString();
+  } catch (error) {
+    msg.textContent = '加载失败：' + (error?.message || error);
+  }
+}
+document.getElementById('styleRefresh')?.addEventListener('click', loadStylePanel);
+
 function renderSlangPanel() {
   const status = slangActiveTab;
   const containerId = status === 'candidate' ? 'slangCandidateList' : status === 'confirmed' ? 'slangConfirmedList' : 'slangRejectedList';
@@ -4315,6 +4545,7 @@ const consolePages = {
   'social-v2': ['二代仿真', '自主参与，恰到好处。', '管理 AI 的工具、唤醒与发言节奏。展开需要调整的分组，修改后保存参数。'],
   'social-v1': ['一代仿真', '为自然对话，设定合适的节奏。', '调整参与概率、活跃周期和分条发送；所有配置项完整保留。'],
   slang: ['黑话词库', '读懂群聊里的，言外之意。', '从候选到确认，让 AI 逐渐熟悉大家的表达习惯。'],
+  style: ['本群语感', '让每一句话，都像这个群。', '查看从群聊语料统计出的说话习惯，以及 bot 发言的接话反馈。'],
   usage: ['令牌与花费', '每一次思考，都算得清楚。', '实时查看 AI 的 token 消耗与花费，可下钻到每个群、每个好友、每一轮对话。'],
   access: ['访问与安全', '明确边界，安心连接。', '管理允许对话的对象、管理员权限与控制台访问凭证。'],
   operations: ['调试与运维', '让桥接，始终井然有序。', '测试消息、引导 AI，或维护桥接进程与会话工作区。'],
@@ -4347,6 +4578,7 @@ function setConsolePage(page, { updateHash = true, focus = false, target = '' } 
   closeConsoleSearch();
   // 语音库按需加载：进入二代仿真页时才探测（避免每次开控制台都压网关）。
   if (page === 'social-v2' && typeof loadVoiceLibrary === 'function') loadVoiceLibrary();
+  if (page === 'style' && typeof loadStylePanel === 'function') loadStylePanel();
   if (focus) {
     document.getElementById('mainContent').focus({ preventScroll: true });
     document.getElementById(target || 'mainContent')?.scrollIntoView({ block: 'start', behavior: 'instant' });

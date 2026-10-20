@@ -72,6 +72,15 @@
 - `web_search` 工具返回的搜索摘要仅作为候选解释，不视为权威；控制台可随时修改或拒绝。
 - 敏感信息/路径/凭据仍走统一审计；黑话库仅存白名单群内消息的文本证据，控制台可删除。
 
+## 本群语感 / 语料库 / 反馈分
+
+- **语料库**：`state/style/corpus.jsonl`，append-only。只采白名单群聊（私聊不落库），单条截断 120 字，保留 30 天（`config.style`）。启动时会把 `state/social-v2.json` 窗口内尚未入库的群消息补录一次（按 messageId 幂等；历史 bot 发言不补录，因为它们没有 messageId 可去重）。
+- **sender 清洗**：SnowLuma 偶尔会把 protobuf 解码残留写进 `sender.card/nickname`（实测 63/63 条全脏，真名埋在控制字符中间）。`src/sender-name.js` 按可读性切段取最长片段，进入语料、黑话证据、成员名缓存前统一清洗。
+- **语感卡**：`src/style-profile.js` 从语料统计句长中位数/P90、连发率、句号使用率、问句占比、高频语气词，生成约 150 字的「【本群语感】」注入唤醒 prompt（每 10 分钟重算，样本不足 20 条不注入）。
+- **反馈分**：`src/style-feedback.js` 统计 bot 发言后 5 分钟内是否有人接话、10 分钟内是否被引用，并按发言长度分桶。接话是粗代理（群聊继续也会算），引用才是强信号。
+- **控制台**：左侧「本群语感」页，读取 `GET /api/style/summary`。
+- **长度上限**：`socialV2.send.maxMessageChars` 和 `social.maxReplyChars` 是**硬拒绝**（超了工具直接报错让 AI 重写），当前 120。软约束靠语感卡和角色卡里的「1~10 字」。
+
 ## 管理员操作手册
 
 ### 切换角色 / 模式（两种途径，均为硬性机制）
@@ -108,4 +117,5 @@
 - 群友诱导 agent 时，preset 的工具限制和目标白名单是主要硬边界。发送工具仍可能造成白名单内的误发；敏感信息正则属于启发式审计，不能识别任意秘密或保证“最多只发一条”。账号和会话隔离仍需结合实际运行模式使用。
 - 想彻底关闭机器人：停止桥接进程（start.bat 窗口 Ctrl+C）或 SnowLuma。
 - 修改白名单/角色/owner 后保存即热更新（控制台写入 config.json / state/*.json 后即时生效）；修改 preset（权威源在 `dsh/agent-presets/`，改完跑 `node scripts/build-agent-preset-patches.mjs` 重新生成 bundle patch）后重启 DSH 生效。
+- **长会话上下文管理（上下文守卫）**：单会话输入上下文（provider 口径 = cacheHit+cacheMiss）超过 `contextGuard.warnTokens`（默认 14 万）时，桥接会向管理员 QQ 私聊发提醒；把 `contextGuard.autoResetTokens`（默认 0=关闭）设为正数后，超阈值且会话空闲时会自动执行与 `/reset` 相同的重置（会一并清掉该会话的二代记忆）。长寿命会话回复变慢的主因就是上下文膨胀，收到提醒后建议及时重置。
 - ⚠️ 桥接只能运行一个实例：消息异常时先检查任务管理器里是否有多余的 `node ...bridge.js`。

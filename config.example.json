@@ -54,6 +54,11 @@
   "security": {
     "interceptNotify": true
   },
+  "style": {
+    "enabled": true,
+    "maxAgeDays": 30,
+    "textMax": 120
+  },
   "slang": {
     "enabled": true,
     "extractMinMessages": 10,
@@ -70,7 +75,7 @@
   },
   "social": {
     "enabled": true,
-    "maxReplyChars": 500,
+    "maxReplyChars": 120,
     "mustReplyKeywords": [
       "deepseek",
       "小鲸鱼",
@@ -191,7 +196,7 @@
       "longGapMaxMs": 10000,
       "maxSendPerMinute": 8,
       "maxSendPerHour": 60,
-      "maxMessageChars": 500,
+      "maxMessageChars": 120,
       "maxGapMs": 10000,
       "gapBaseMs": 800,
       "gapPerCharMs": 20,
@@ -250,5 +255,13 @@
       "wakeRecentLimit": 4,
       "wakeMaxChars": 6000
     }
+  },
+  "contextGuard": {
+    "enabled": true,
+    "warnTokens": 140000,
+    "notifyCooldownMs": 21600000,
+    "autoResetTokens": 0,
+    "quietMs": 60000,
+    "checkIntervalMs": 300000
   }
 }

@@ -109,6 +109,26 @@ export function isPrivateIp(ip) {
   return true;
 }
 
+/**
+ * Clash / mihomo 的 fake-ip 占位段：198.18.0.0/15
+ * （IANA benchmarking 段，也是 mihomo 默认的 `fake-ip-range: 198.18.0.1/16`）
+ *
+ * 为什么不能按「内网地址」拒绝它：在启用 TUN + fake-ip 的机器上，本地 DNS 对**任何**域名
+ * 都返回这个段里的占位地址，真实解析发生在上游代理节点。所以占位地址不是「内网服务」，
+ * 而是「交给代理去连」的标记 —— 连它正是 TUN 的正常工作方式（浏览器走的就是这条路径）。
+ *
+ * ⚠️ 只放行这一个段，而且只在 hostname 的解析结果上生效：
+ *   - 直接写 IP 字面量（包括 198.18.x.x）仍然拒绝，不留探测代理内部的口子；
+ *   - 真实内网段（10 / 172.16 / 192.168 / 127 / CGNAT / 链路本地 …）仍然拒绝；
+ *   - 解析结果里只要出现一个真实内网地址，整体仍然拒绝（fail-closed）。
+ */
+export function isFakeIpPlaceholder(ip) {
+  const s = String(ip || '').trim();
+  if (net.isIP(s) !== 4) return false;
+  const parts = s.split('.').map(Number);
+  return parts[0] === 198 && parts[1] >= 18 && parts[1] <= 19;
+}
+
 export async function resolveSafeHost(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
   if (!h) throw new Error('主机名为空');
@@ -126,12 +146,15 @@ export async function resolveSafeHost(hostname) {
     throw new Error(`域名解析失败：${error?.message ?? error}`);
   }
   if (!addresses.length) throw new Error('域名没有解析结果');
+  // fake-ip 占位地址不算内网；真实的内网解析结果仍然一律拒绝（fail-closed，混合结果也拒）。
   for (const { address } of addresses) {
-    if (isPrivateIp(address)) {
+    if (isPrivateIp(address) && !isFakeIpPlaceholder(address)) {
       throw new Error('域名解析到内网/本机地址，已阻止');
     }
   }
-  return addresses[0].address;
+  // 有真实公网地址就优先用它；全是占位地址时连占位地址，由 TUN/代理接管远端解析。
+  const real = addresses.find(({ address }) => !isPrivateIp(address));
+  return (real ?? addresses[0]).address;
 }
 
 export async function validateFetchUrl(raw) {
